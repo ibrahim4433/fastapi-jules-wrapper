@@ -125,8 +125,9 @@ async def poll_jules_activities(client: httpx.AsyncClient, session_id: str) -> s
        response = await client.get(url, headers=headers, timeout=10.0)
        
        if response.status_code != 200:
-           logger.error(f"Failed to poll activities. Status: {response.status_code}, Body: {response.text}")
-           raise HTTPException(status_code=502, detail=f"Failed to communicate with Jules API during polling. Response: {response.text}")
+           logger.warning(f"Polling failed (Status: {response.status_code}). Retrying... Body: {response.text}")
+           await asyncio.sleep(2.0)
+           continue
            
        activities_data = response.json()
        activities = activities_data.get("activities", [])
@@ -143,13 +144,16 @@ async def poll_jules_activities(client: httpx.AsyncClient, session_id: str) -> s
            if "sessionCompleted" in activity:
                is_completed = True
                
+           # Log the raw activity to understand the API's JSON structure
+           logger.info(f"Raw Activity: {activity}")
+           
            # Extract output payloads from the agent
-           if activity.get("originator") == "agent":
-               if "agentMessaged" in activity:
-                   agent_msg = activity["agentMessaged"]
-                   final_output = agent_msg.get("message", activity.get("description", final_output))
-               elif "progressUpdated" in activity:
-                   final_output = activity["progressUpdated"].get("description", final_output)
+           if "agentMessaged" in activity:
+               agent_msg = activity["agentMessaged"]
+               final_output = agent_msg.get("agentMessage", activity.get("description", final_output))
+               is_completed = True  # Repoless sessions behave like chat; they don't emit sessionCompleted!
+           elif "progressUpdated" in activity:
+               final_output = activity["progressUpdated"].get("description", final_output)
                    
        if is_completed:
            return final_output
