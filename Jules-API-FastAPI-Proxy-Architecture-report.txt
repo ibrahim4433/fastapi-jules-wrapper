@@ -1,0 +1,382 @@
+﻿Architectural Blueprint: Transforming the Jules Autonomous Agent into a Stateless LLM API Proxy Infrastructure
+The rapid evolution of artificial intelligence has precipitated a bifurcation in model deployment architectures, resulting in two distinct paradigms: standard stateless Large Language Model (LLM) endpoints and stateful, autonomous agents. The industry standard, exemplified by the OpenAI REST API and Google's Gemini API, relies on stateless, text-in/text-out completions where the server retains no memory of the interaction between requests1. Conversely, autonomous agents like Google's experimental Jules API are engineered to operate asynchronously within complex environments, actively cloning repositories, provisioning virtual machines, generating multi-step execution plans, and independently modifying codebases3.
+The architectural mandate detailed in this report involves constructing a Python FastAPI proxy server designed to subjugate the Jules API, stripping it of its agency, environmental dependencies, and statefulness. The objective is to construct pure infrastructure that forces the Jules agent to function strictly as a standard, stateless LLM endpoint. By intercepting inbound requests formatted to the OpenAI specification, translating them into isolated, repoless Jules sessions, polling the asynchronous activities, and formatting the final output, the proxy architecture successfully tames the agent into returning raw, deterministic JSON payloads.
+Phase 1: Architectural Divergence - Jules Agent API versus Stateless LLM APIs
+To effectively construct a bridging infrastructure, a thorough analysis of the fundamental architectural disparities between standard stateless LLM APIs and the Jules agent ecosystem is required.
+The standard stateless paradigm, utilized by the OpenAI and Gemini APIs, processes interactions synchronously from the client's perspective (or utilizes Server-Sent Events for localized streaming)6. An inbound HTTP POST request to an endpoint such as /v1/chat/completions contains an array of messages representing the conversation history6. The underlying infrastructure processes the prompt, generates the token sequence, and returns a rigidly formatted JSON response containing the final output. The model possesses no agency to execute tools, modify files, or trigger external workflows unless explicitly bound to a framework via rigid function calling8.
+In stark contrast, the Jules API is designed as an asynchronous, long-running task-execution engine. It operates on a stateful architecture built around three core hierarchical resources, defined in the Google API conventions5:
+1. Sources (sources/{sourceId}): The input environments, typically GitHub repositories, providing the workspace context5.
+2. Sessions (sessions/{sessionId}): Continuous, asynchronous units of work representing a specific task or project initiated with a prompt and a source5.
+3. Activities (sessions/{sessionId}/activities/{activityId}): Chronological events within a session, documenting the agent's progress, plan generation, code modifications, and messages5.
+When interacting with Jules, the client does not wait for a synchronous text response. Instead, an API request to POST /v1alpha/sessions initiates a background job10. Jules provisions a cloud virtual machine, clones the specified repository, evaluates the codebase, optionally awaits human plan approval, and executes file changes4. Progress is monitored by repeatedly polling the GET /v1alpha/sessions/{sessionId}/activities endpoint to retrieve a log of events until a terminal state (sessionCompleted or sessionFailed) is reached5.
+Architectural Feature
+	Stateless LLM API (OpenAI/Gemini)
+	Stateful Agent API (Jules)
+	Execution Model
+	Synchronous REST or SSE Streaming
+	Asynchronous Background Task Polling
+	Context Memory
+	None (Client provides full message history)
+	High (Maintains persistent session state)
+	Environmental Agency
+	None (Text generation only)
+	High (VM provisioning, GitHub cloning)
+	Output Mechanism
+	Immediate JSON payload (choices array)
+	Incremental Activity logs and changeSets
+	Bridging these two paradigms requires a robust translation layer capable of managing state on behalf of the client. The FastAPI proxy server must receive a synchronous REST call, initiate an asynchronous Jules session, hold the client's HTTP connection open while actively polling the Jules API for updates, and finally extract the text artifact to format it into the expected JSON schema.
+Phase 2: Bypassing Workspace Mechanics for Repoless Execution
+The default operational mode of the Jules agent relies heavily on workspace context. The agent is specifically trained to interact with GitHub mechanics, seeking out repository files, executing bash commands, reading configuration files like AGENTS.md, and proposing pull requests upon task completion4. To tame Jules into a pure LLM, these mechanics must be entirely bypassed.
+According to the Jules API specifications, the sourceContext field within the session creation payload is responsible for linking the task to a specific codebase10. This object typically contains the source path and a githubRepoContext defining the starting branch10. However, the documentation explicitly states that this parameter is optional, designed specifically for "repoless" sessions5.
+By deliberately omitting the sourceContext entirely from the API request payload, the FastAPI proxy server forces Jules to initialize in an empty, dummy workspace devoid of repositories, branches, or predefined environment configurations. Operating in a repoless state inherently prevents the agent from attempting to read external files or pushing code to remote branches. However, because the underlying model is heavily fine-tuned for autonomous software engineering tasks, it may still attempt to generate execution plans or simulate file modifications.
+To counteract this inherent agentic behavior, the session initialization must explicitly enforce full automation. The session creation payload must ensure the automationMode parameter is either omitted or strictly configured to prevent PR generation10. Crucially, the requirePlanApproval parameter must be explicitly set to false5. If this parameter defaults to true or is misconfigured, the session state will transition to AWAITING_PLAN_APPROVAL and stall indefinitely, waiting for a human to call the /v1alpha/sessions/{sessionId}:approvePlan endpoint5. Setting it to false ensures the agent proceeds directly to execution without stalling.
+The architectural payload for a repoless, fully automated session takes the following structural form:
+
+
+JSON Parameter
+	Type
+	Proxy Configuration Strategy
+	prompt
+	string
+	The flattened conversation array combined with strict system jailbreak instructions.
+	title
+	string
+	A statically assigned string (e.g., "Stateless API Execution") to satisfy potential requirements.
+	sourceContext
+	object
+	Omitted entirely to enforce an isolated, repoless dummy context.
+	requirePlanApproval
+	boolean
+	Set to false to bypass human intervention and prevent stalling5.
+	automationMode
+	string
+	Omitted to disable any automated GitHub PR generation mechanics10.
+	Phase 3: Orchestrating Stateless, Concurrent Execution Environments
+Transforming a long-polling, stateful agent API into a high-throughput, concurrent proxy server requires careful orchestration of asynchronous execution environments. Python's FastAPI framework, built upon Starlette and AsyncIO, provides the necessary asynchronous primitives to achieve this12.
+Concurrency and the AsyncIO Event Loop
+The proxy server must handle multiple incoming HTTP requests simultaneously, maintaining isolated Jules instances for each request. If the server were to use synchronous HTTP clients (such as the standard requests library) to poll the Jules API, the thread would block, stalling the entire application and severely degrading throughput13. Under heavy load, blocking the event loop results in latency spikes, timeouts, and cascading failures across all concurrent client connections15.
+To circumvent this, the architecture mandates the use of httpx.AsyncClient for all outbound interactions with the Google APIs16. Each inbound request to the FastAPI endpoint spawns a lightweight, non-blocking asynchronous task. The server initiates the Jules session and enters an asynchronous while loop, utilizing asyncio.sleep() to yield control back to the event loop between polling intervals. This ensures that a single ASGI worker process can concurrently monitor hundreds of isolated Jules sessions without exhausting thread pools18.
+Polling Mechanics and State Management
+Once a session is initiated via the POST /v1alpha/sessions endpoint, the server receives an immediate response containing the unique sessionId (e.g., sessions/31415926535897932384) and an initial state of QUEUED or PLANNING5. The orchestration logic must then continuously query the GET /v1alpha/sessions/{sessionId}/activities endpoint to monitor the agent's progress5.
+The activities array represents a chronological ledger of the agent's actions, with each item containing an originator field (typically "agent", "user", or "system") and an event payload5. The proxy server must parse this array to identify specific state transitions:
+1. Terminal State Detection: The polling loop must scan the activities for terminal event payloads, specifically sessionCompleted or sessionFailed5. The presence of either signals that the agent's execution has concluded and the polling loop can be safely terminated.
+2. Payload Extraction: Because the agent is operating in an empty, repoless environment, it cannot output its work via file modifications (changeSet) or terminal executions (bashOutput)10. Instead, the output will manifest as text within an agentMessaged activity or within the description of a progressUpdated activity5. The extraction logic must iterate through the activities to locate the final text payload generated by the agent.
+Mitigating Rate Limits and Quota Exhaustion
+The orchestration layer must account for the strict rate limits imposed by the Jules API. Usage limits operate on a rolling 24-hour window, restricting concurrent tasks (ranging from 3 to 60, depending on the tier) and total daily tasks (ranging from 15 to 300)20. Additionally, the underlying Google Cloud API infrastructure enforces token consumption limits and request rate limits per minute22.
+If the proxy server receives a burst of traffic that exceeds the Jules concurrent task limit, the Google API will return an HTTP 429 (Resource Exhausted) or a 400 series error indicating "Quota exceeded"23. The FastAPI exception handlers must gracefully intercept these specific upstream errors and translate them into appropriate JSON-formatted HTTP 429 or 503 responses for the downstream client, ensuring the proxy remains robust under heavy load25. Furthermore, implementing an exponential backoff algorithm within the polling loop (e.g., min(((2^n)+random_number_milliseconds), maximum_backoff)) prevents the proxy from aggressively consuming API read quotas while waiting for a session to complete27.
+Phase 4: The FastAPI Wrapper and Output Formatting
+The final architectural phase involves constructing the outer API interface and implementing the prompt engineering necessary to strictly format the agent's output. The goal is to perfectly mimic the OpenAI /v1/chat/completions REST endpoint, ensuring seamless integration with existing client libraries and tools1.
+Message Flattening and Pre-System Prompt Injection
+Standard LLM APIs utilize a messages array containing distinct roles, typically system, user, and assistant6. The system message provides developer instructions, user messages contain the queries, and assistant messages store previous model responses to provide conversation history6. The Jules API, however, accepts only a single prompt string during session creation10. Therefore, the FastAPI server must flatten the incoming OpenAI-style message array into a single contiguous string, preserving the role context28.
+More importantly, because Jules is fine-tuned to act as a proactive software engineer, it natively generates conversational filler, proposes action plans, and attempts to explain its reasoning4. To suppress this behavior and enforce strict JSON output, the server must inject a severe "Pre-System Prompt" at the very beginning of the flattened string.
+This instruction acts as a jailbreak, establishing immutable constraints on the agent's behavior. It must explicitly command the agent to:
+1. Analyze the provided data.
+2. Perform the required work.
+3. Return the final output strictly as a raw JSON string.
+4. Refrain from creating files, generating pull requests, or including any conversational text, markdown formatting blocks, or explanations.
+By prepending this directive to every incoming request, the proxy forces the Jules agent to abandon its standard operating procedure and function purely as a data transformation engine, replicating the behavior of a model utilizing standard JSON mode1.
+Response Interception, Sanitization, and Translation
+Upon detecting the sessionCompleted activity, the proxy extracts the final text payload10. Despite the strict system prompt, language models occasionally wrap JSON outputs in markdown code blocks (e.g., ```json) or prepend whitespace1. The server must sanitize the extracted string, stripping away any extraneous formatting, and parse it to verify its structure.
+Finally, the sanitized payload is wrapped in the standard OpenAI response schema. This schema consists of a root object containing an id, an object type (chat.completion), a Unix timestamp (created), the model name, and a choices array6. The choices array holds a message object with the role set to "assistant" and the content field containing the agent's raw output6. This fully constructed JSON response is serialized and returned to the waiting client, completing the illusion of a standard stateless API interaction.
+Deliverables: Infrastructure Implementation
+The following sections detail the exact configuration, dependencies, and codebase required to deploy this architectural solution.
+1. Architectural Handling of the Jules Empty Context
+Based on the API documentation, the Jules agent requires a session initialization to commence work. Normally, a repository is provided via the sourceContext parameter5. To create an empty context, the proxy server deliberately constructs the JSON payload for the POST /v1alpha/sessions endpoint with the sourceContext parameter entirely omitted5. Furthermore, the proxy dictates requirePlanApproval: false to ensure the agent does not halt its execution awaiting a human to approve an arbitrary plan5. By isolating the agent in this repoless void, it is forced to rely solely on the injected prompt, processing the user's data and returning the result through its internal activity log rather than attempting to manipulate external files.
+2. Environment Configuration (requirements.txt)
+To ensure high performance and asynchronous capability, the proxy relies on a modern Python async stack. FastAPI provides the web framework, uvicorn acts as the ASGI server, httpx manages asynchronous outbound HTTP requests to the Jules API, and pydantic handles the strict validation of the incoming OpenAI-format JSON payloads16.
+
+
+
+
+
+
+Plaintext
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+httpx>=0.24.1
+pydantic>=2.0.0
+
+3. The Core Orchestration Server (main.py)
+The implementation below contains the complete routing logic, Pydantic data models for request validation, the asynchronous polling engine, and the prompt translation mechanisms.
+
+
+
+
+
+
+Python
+import os
+import json
+import asyncio
+import logging
+import time
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+import httpx
+
+# Configure logging for production observability
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# Core Jules API Configuration
+JULES_API_BASE = "https://jules.googleapis.com/v1alpha"
+JULES_API_KEY = os.environ.get("JULES_API_KEY")
+
+if not JULES_API_KEY:
+   logger.warning("JULES_API_KEY environment variable is not set. API calls will fail.")
+
+# ==========================================
+# Pydantic Models for OpenAI API Mimicry
+# ==========================================
+
+class Message(BaseModel):
+   role: str
+   content: str
+
+class ChatCompletionRequest(BaseModel):
+   model: str = Field(default="jules-proxy-model")
+   messages: List[Message]
+   temperature: Optional[float] = 1.0
+
+class MessageResponse(BaseModel):
+   role: str = "assistant"
+   content: str
+
+class Choice(BaseModel):
+   index: int = 0
+   message: MessageResponse
+   finish_reason: str = "stop"
+
+class ChatCompletionResponse(BaseModel):
+   id: str
+   object: str = "chat.completion"
+   created: int
+   model: str
+   choices: List[Choice]
+
+# ==========================================
+# FastAPI Application Initialization
+# ==========================================
+
+app = FastAPI(
+   title="Jules Stateless LLM Proxy",
+   description="Transforms the stateful Jules Agent into a stateless OpenAI-compatible REST API.",
+   version="1.0.0"
+)
+
+# Global Exception Handler for clean error propagation
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+   logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
+   return JSONResponse(
+       status_code=500,
+       content={"error": {"message": "Internal Proxy Error", "type": "server_error", "details": str(exc)}}
+   )
+
+# ==========================================
+# Core Orchestration Logic
+# ==========================================
+
+async def initiate_jules_session(client: httpx.AsyncClient, prompt_payload: str) -> str:
+   """
+   Initiates a repoless Jules session.
+   Omitting 'sourceContext' forces the agent into an empty, dummy environment.
+   """
+   url = f"{JULES_API_BASE}/sessions"
+   headers = {
+       "Content-Type": "application/json",
+       "x-goog-api-key": JULES_API_KEY
+   }
+   
+   # Payload specifically omits automationMode and sets requirePlanApproval to False
+   data = {
+       "prompt": prompt_payload,
+       "requirePlanApproval": False,
+       "title": "Stateless Proxy Execution"
+   }
+   
+   response = await client.post(url, headers=headers, json=data, timeout=15.0)
+   
+   if response.status_code != 200:
+       logger.error(f"Failed to create Jules session. Status: {response.status_code}, Body: {response.text}")
+       if response.status_code == 429 or "Quota exceeded" in response.text:
+           raise HTTPException(status_code=429, detail="Jules API Quota Exceeded. Rate limit hit.")
+       raise HTTPException(status_code=502, detail=f"Upstream Jules API Error: {response.text}")
+       
+   session_data = response.json()
+   return session_data.get("id")
+
+async def poll_jules_activities(client: httpx.AsyncClient, session_id: str) -> str:
+   """
+   Asynchronously polls the Jules session activities until a terminal state is reached.
+   """
+   # The session_id format from creation is typically "sessions/{id}"
+   # Activities endpoint expects: /v1alpha/{session_id}/activities
+   url = f"{JULES_API_BASE}/{session_id}/activities?pageSize=50"
+   headers = {
+       "x-goog-api-key": JULES_API_KEY
+   }
+   
+   max_attempts = 120 # Polling limit (e.g., ~4 minutes maximum execution time)
+   attempts = 0
+   
+   while attempts < max_attempts:
+       attempts += 1
+       response = await client.get(url, headers=headers, timeout=10.0)
+       
+       if response.status_code != 200:
+           logger.error(f"Failed to poll activities. Status: {response.status_code}")
+           raise HTTPException(status_code=502, detail="Failed to communicate with Jules API during polling.")
+           
+       activities_data = response.json()
+       activities = activities_data.get("activities", [])
+       
+       is_completed = False
+       final_output = ""
+       
+       # Parse activities chronologically to find terminal states
+       for activity in activities:
+           if "sessionFailed" in activity:
+               logger.error(f"Session {session_id} failed.")
+               raise HTTPException(status_code=500, detail="Jules Agent execution failed internally.")
+               
+           if "sessionCompleted" in activity:
+               is_completed = True
+               
+           # Extract output payloads from the agent
+           if activity.get("originator") == "agent":
+               if "agentMessaged" in activity:
+                   final_output = activity.get("description", final_output)
+               elif "progressUpdated" in activity:
+                   final_output = activity["progressUpdated"].get("description", final_output)
+                   
+       if is_completed:
+           return final_output
+           
+       # Yield control back to the asyncio event loop
+       await asyncio.sleep(2.0)
+       
+   raise HTTPException(status_code=504, detail="Proxy timeout: Jules Agent took too long to complete the task.")
+
+def construct_strict_prompt(messages: List[Message]) -> str:
+   """
+   Flattens the OpenAI messages array into a single string and injects the overriding system prompt.
+   """
+   system_directive = (
+       "CRITICAL SYSTEM OVERRIDE: You are currently operating as a stateless, localized LLM endpoint. "
+       "You do not possess a workspace, you do not have access to GitHub, and you cannot execute files. "
+       "Analyze the following conversation data, perform the requested task, and return the final output "
+       "ONLY as a raw JSON string matching the standard output format. "
+       "DO NOT create files. DO NOT make pull requests. DO NOT include conversational filler, greetings, "
+       "or explanations. DO NOT wrap the output in markdown blocks (e.g., avoid ```json). "
+       "Return the raw JSON payload exclusively.\n\n"
+       "--- START CONVERSATION HISTORY ---\n"
+   )
+   
+   conversation = ""
+   for msg in messages:
+       conversation += f"Role [{msg.role}]: {msg.content}\n\n"
+       
+   return system_directive + conversation + "--- END CONVERSATION HISTORY ---\nOUTPUT RAW JSON ONLY:"
+
+# ==========================================
+# API Endpoints
+# ==========================================
+
+@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+async def chat_completions(request: ChatCompletionRequest):
+   """
+   The primary proxy endpoint. Mimics standard stateless LLM behavior.
+   """
+   if not JULES_API_KEY:
+       raise HTTPException(status_code=500, detail="Server misconfiguration: Missing JULES_API_KEY")
+       
+   flattened_prompt = construct_strict_prompt(request.messages)
+   
+   async with httpx.AsyncClient() as client:
+       session_id = await initiate_jules_session(client, flattened_prompt)
+       logger.info(f"Successfully initiated repoless Jules Session: {session_id}")
+       raw_output = await poll_jules_activities(client, session_id)
+       
+   # Output Sanitization
+   sanitized_output = raw_output.strip()
+   if sanitized_output.startswith("```json"):
+       sanitized_output = sanitized_output[7:]
+   if sanitized_output.startswith("```"):
+       sanitized_output = sanitized_output[3:]
+   if sanitized_output.endswith("```"):
+       sanitized_output = sanitized_output[:-3]
+   sanitized_output = sanitized_output.strip()
+
+   # Construct the OpenAI-compatible response
+   response = ChatCompletionResponse(
+       id=f"chatcmpl-{session_id.split('/')[-1]}",
+       created=int(time.time()),
+       model=request.model,
+       choices=[
+           Choice(
+               message=MessageResponse(content=sanitized_output)
+           )
+       ]
+   )
+   
+   return response
+
+if __name__ == "__main__":
+   import uvicorn
+   uvicorn.run(app, host="0.0.0.0", port=8000)
+
+4. Full Project Details and Production Hardening
+To instantiate and operationalize the infrastructure securely, an organization must manage the environment variables, API key security, and network topology accurately.
+API Key Security and Restrictions The proxy server must be authenticated with Google. An administrator must navigate to jules.google.com/settings, generate a designated API Key, and securely inject it into the proxy's runtime environment5. However, unrestricted API keys pose a severe security vulnerability, potentially allowing malicious actors to rack up charges or exhaust quotas33. Best practices dictate that the Google Cloud API key must be restricted. Because the key is utilized server-side within the FastAPI proxy, it should be restricted by IP address (e.g., --allowed-ips), ensuring that only requests originating from the proxy server's static IP are accepted by the Google API33. Never embed the API key directly into the application's source code35.
+Server Deployment Strategy Execute the proxy using standard ASGI runners, specifically Uvicorn12. For a production deployment, launching multiple Uvicorn workers ensures the process scales horizontally across available CPU cores. This maximizes the async event loop's capability to juggle thousands of concurrent long-polling sessions and network I/O operations without blocking13.
+
+
+
+
+
+
+Bash
+pip install -r requirements.txt
+export JULES_API_KEY="your-secure-restricted-key"
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+
+Client Integration Once deployed, downstream applications, automated systems, or existing SDKs (such as the official OpenAI Python package) simply modify their base_url parameter to point to the FastAPI proxy (http://localhost:8000/v1)1. The interaction remains fully transparent to the end-user or client application, unaware that an autonomous, stateful VM-backed agent is actively being orchestrated in the background to fulfill the text generation request.
+Works cited
+1. How to use JSON mode with Azure OpenAI in Microsoft Foundry Models, https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/json-mode
+2. Structured outputs - Interactions API - Google AI for Developers, https://ai.google.dev/gemini-api/docs/structured-output
+3. Jules - An Autonomous Coding Agent, https://jules.google/
+4. Getting started | Jules, https://jules.google/docs/
+5. API Reference | Jules, https://jules.google/docs/api/reference/overview/
+6. Create chat completion | OpenAI API Reference, https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create
+7. Server-Sent Events (SSE) - FastAPI, https://fastapi.tiangolo.com/tutorial/server-sent-events/
+8. Structured model outputs | OpenAI API, https://developers.openai.com/api/docs/guides/structured-outputs
+9. REST Reference - Jules API | Google for Developers, https://developers.google.com/jules/api/reference/rest
+10. Jules API | Google for Developers, https://developers.google.com/jules/api
+11. Dive into the technical details of the new Google Jules API - Ali Arsanjani, https://dr-arsanjani.medium.com/dive-into-the-technical-details-of-the-new-google-jules-api-672182748059
+12. Building a Real-time Streaming API with FastAPI and OpenAI: A Comprehensive Guide | by stark | Medium, https://medium.com/@shudongai/building-a-real-time-streaming-api-with-fastapi-and-openai-a-comprehensive-guide-cb65b3e686a5
+13. Top 7 FastAPI asyncio Best Practices for Non‑Blocking Web APIs - Techbuddies Studio, https://www.techbuddies.io/2026/01/05/top-7-fastapi-asyncio-best-practices-for-non-blocking-web-apis/
+14. FastAPI in Practice: Building High-Performance APIs - Tim Derzhavets, https://timderzhavets.com/blog/fastapi-in-practice-building-high-performance-apis-2/
+15. FastAPI Async vs Sync: Benchmark Results | by Kenan Can | Medium, https://medium.com/@kenancan.dev/fastapi-async-vs-sync-benchmark-results-2c5798bbdb16
+16. Async Tests - FastAPI, https://fastapi.tiangolo.com/advanced/async-tests/
+17. Benchmarking sync/async FastAPI operations in different contexts - GitHub, https://github.com/Minibrams/fastapi-benchmark
+18. The Ultimate FastAPI Tutorial Part 9 - Asynchronous Performance Improvement, https://christophergs.com/tutorials/ultimate-fastapi-tutorial-pt-9-asynchronous-performance-basics/
+19. Asyncio is neither fast nor slow - Jamie's Blog, https://blog.changs.co.uk/asyncio-is-neither-fast-nor-slow.html
+20. Limits and Plans | Jules, https://jules.google/docs/usage-limits/
+21. Limits and usage - Jules, https://jules-documentation.web.app/usage-limits
+22. Data API limits and quotas - Analytics - Google for Developers, https://developers.google.com/analytics/devguides/reporting/data/v1/quotas
+23. Rate limits | Gemini API - Google AI for Developers, https://ai.google.dev/gemini-api/docs/rate-limits
+24. Authentication | Jules, https://jules.google/docs/api/reference/authentication/
+25. FastAPI Error Handling: Types, Methods, and Best Practices - Honeybadger.io, https://www.honeybadger.io/blog/fastapi-error-handling/
+26. FastAPI Error Handling Patterns | Better Stack Community, https://betterstack.com/community/guides/scaling-python/error-handling-fastapi/
+27. Usage limits | Google Sheets, https://developers.google.com/workspace/sheets/api/limits
+28. How to write "System" Instructions for OpenAI's GPT-4 Chat API | Rootstrap, https://www.rootstrap.com/blog/how-to-write-system-instructions-for-openais-gpt-4-chat-api
+29. What exactly does a System msg do? - Prompting - OpenAI Developer Community, https://community.openai.com/t/what-exactly-does-a-system-msg-do/459409
+30. How to structure system prompt, RAG context, and user input for multi-turn RAG-based chatbots using OpenAI Chat Completions, https://community.openai.com/t/how-to-structure-system-prompt-rag-context-and-user-input-for-multi-turn-rag-based-chatbots-using-openai-chat-completions/1292995
+31. Introducing Structured Outputs in the API - OpenAI, https://openai.com/index/introducing-structured-outputs-in-the-api/
+32. Real-time OpenAI response streaming with FastAPI - Sevalla, https://sevalla.com/blog/real-time-openai-streaming-fastapi/
+33. How to Secure API Keys with Application and IP Restrictions in GCP - OneUptime, https://oneuptime.com/blog/post/2026-02-17-how-to-secure-api-keys-with-application-and-ip-restrictions-in-gcp/view
+34. Google Maps Platform best practices: Restricting API keys, https://mapsplatform.google.com/resources/blog/google-maps-platform-best-practices-restricting-api-keys/
+35. Best practices for securely using API keys - API Console Help - Google Help, https://support.google.com/googleapi/answer/6310037?hl=en
