@@ -99,12 +99,17 @@ async def initiate_jules_session(client: httpx.AsyncClient, prompt_payload: str)
        raise HTTPException(status_code=502, detail=f"Upstream Jules API Error: {response.text}")
        
    session_data = response.json()
-   return session_data.get("id")
+   logger.info(f"Session data received: {session_data}")
+   # Google APIs commonly use 'name' instead of 'id' (e.g. 'sessions/123')
+   return session_data.get("name") or session_data.get("id")
 
 async def poll_jules_activities(client: httpx.AsyncClient, session_id: str) -> str:
    """
    Asynchronously polls the Jules session activities until a terminal state is reached.
    """
+   if not session_id.startswith("sessions/"):
+       session_id = f"sessions/{session_id}"
+       
    # The session_id format from creation is typically "sessions/{id}"
    # Activities endpoint expects: /v1alpha/{session_id}/activities
    url = f"{JULES_API_BASE}/{session_id}/activities?pageSize=50"
@@ -120,8 +125,8 @@ async def poll_jules_activities(client: httpx.AsyncClient, session_id: str) -> s
        response = await client.get(url, headers=headers, timeout=10.0)
        
        if response.status_code != 200:
-           logger.error(f"Failed to poll activities. Status: {response.status_code}")
-           raise HTTPException(status_code=502, detail="Failed to communicate with Jules API during polling.")
+           logger.error(f"Failed to poll activities. Status: {response.status_code}, Body: {response.text}")
+           raise HTTPException(status_code=502, detail=f"Failed to communicate with Jules API during polling. Response: {response.text}")
            
        activities_data = response.json()
        activities = activities_data.get("activities", [])
@@ -141,7 +146,8 @@ async def poll_jules_activities(client: httpx.AsyncClient, session_id: str) -> s
            # Extract output payloads from the agent
            if activity.get("originator") == "agent":
                if "agentMessaged" in activity:
-                   final_output = activity.get("description", final_output)
+                   agent_msg = activity["agentMessaged"]
+                   final_output = agent_msg.get("message", activity.get("description", final_output))
                elif "progressUpdated" in activity:
                    final_output = activity["progressUpdated"].get("description", final_output)
                    
