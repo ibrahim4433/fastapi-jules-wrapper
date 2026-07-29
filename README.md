@@ -116,5 +116,43 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+## 💬 Stateful Conversations (Follow-up Messages)
+
+While the default `/v1/chat/completions` endpoint operates statelessly (creating a new session for every request), you can manually interact with the **same Jules session** to send follow-up prompts and create an experience similar to the OpenAI Assistants API.
+
+Here is the step-by-step guide on how to do it:
+
+### Step 1: Extract the Session ID
+When you make a request to the proxy, it returns a standard OpenAI JSON response. Look at the `id` field.
+```json
+{
+  "id": "chatcmpl-9002916533543203582",
+  "object": "chat.completion"
+}
+```
+The proxy embeds the actual Jules Session ID into this field. In this example, your session ID is `sessions/9002916533543203582`.
+
+### Step 2: Send a Follow-up Message
+You can send a follow-up message directly to the Jules API using the `sendMessage` endpoint. You do not need to use the proxy for this step.
+
+```bash
+curl -X POST "https://jules.googleapis.com/v1alpha/sessions/9002916533543203582:sendMessage" \
+  -H "Content-Type: application/json" \
+  -H "x-goog-api-key: YOUR_JULES_API_KEY" \
+  -d '{
+    "message": "That was great! Now write a second stanza."
+  }'
+```
+
+### Step 3: Poll for the Reply
+Once the message is sent, Jules will process the new prompt and append his response to the activity log. You can manually poll the activities endpoint to grab his reply:
+
+```bash
+curl -X GET "https://jules.googleapis.com/v1alpha/sessions/9002916533543203582/activities?pageSize=50" \
+  -H "x-goog-api-key: YOUR_JULES_API_KEY"
+```
+
+Look through the JSON response for the latest activity containing an `agentMessaged` block to find your result!
+
 ## 📜 Logging and Debugging
 If a request fails or times out, check the Uvicorn terminal output. The proxy logs the exact REST requests, `404` eventual-consistency retries, and the raw JSON of the `activities` array received from the Google API to help you debug.
